@@ -167,20 +167,28 @@ def replace_shortcuts(text):
     )
     return pattern.sub(lambda match: REPLACEMENTS[match.group(0)], text)
 
-
 _EDITOR_SCRIPT = r"""
 (() => {
+  if (window.__mathShortcutsInstalled) return;
+  window.__mathShortcutsInstalled = true;
+
   const replacements = __REPLACEMENTS__;
   const shortcuts = Object.keys(replacements).sort((a, b) => b.length - a.length);
-  const attachedDocuments = new WeakSet();
+  const delimiter = /[\s\u00a0,.;:!?()[\]{}$]/;
 
-  function convertInput(event, doc) {
-    const target = event.target && event.target.nodeType === 1
-      ? event.target
-      : event.target && event.target.parentElement;
-    const field = target && target.closest('[contenteditable="true"]');
-    const selection = doc.getSelection();
-    if (!field || !selection || selection.rangeCount === 0) return;
+  function convertInput(event) {
+    if (event.inputType && !event.inputType.startsWith('insert')) return;
+
+    const path = event.composedPath ? event.composedPath() : [];
+    let target = path[0] || event.target;
+    if (target && target.nodeType !== 1) target = target.parentElement;
+    const field = target && target.closest && target.closest('[contenteditable]');
+    if (!field) return;
+
+    const root = field.getRootNode();
+    const selection =
+      root && root.getSelection ? root.getSelection() : document.getSelection();
+    if (!selection || selection.rangeCount === 0) return;
 
     const node = selection.anchorNode;
     const offset = selection.anchorOffset;
@@ -188,7 +196,7 @@ _EDITOR_SCRIPT = r"""
 
     const text = node.data;
     const end = offset - 1;
-    if (end < 0 || !/[\s,.;:!?()[\]{}$]/.test(text.charAt(end))) return;
+    if (end < 0 || !delimiter.test(text.charAt(end))) return;
 
     const before = text.slice(0, end);
     for (const shortcut of shortcuts) {
@@ -200,44 +208,24 @@ _EDITOR_SCRIPT = r"""
       }
 
       const start = end - shortcut.length;
-      node.data = text.slice(0, start) + replacements[shortcut] + text.slice(end);
-      selection.collapse(node, offset + replacements[shortcut].length - shortcut.length);
+      const range = document.createRange();
+      range.setStart(node, start);
+      range.setEnd(node, offset); // shortcut + the delimiter just typed
+      selection.removeAllRanges();
+      selection.addRange(range);
+      document.execCommand(
+        'insertText', false, replacements[shortcut] + text.charAt(end)
+      );
       return;
     }
   }
 
-  function attachDocument(doc) {
-    if (!doc || attachedDocuments.has(doc)) return;
-    attachedDocuments.add(doc);
-    doc.addEventListener('input', event => convertInput(event, doc), true);
-
-    const attachFrames = root => {
-      for (const frame of root.querySelectorAll('iframe')) {
-        const attach = () => {
-          try {
-            attachDocument(frame.contentDocument);
-          } catch (error) {
-            console.warn('Math shortcut converter could not access an editor frame.', error);
-          }
-        };
-        frame.addEventListener('load', attach);
-        attach();
-      }
-    };
-
-    if (doc.documentElement) {
-      attachFrames(doc.documentElement);
-      new MutationObserver(() => attachFrames(doc.documentElement))
-        .observe(doc.documentElement, { childList: true, subtree: true });
-    }
-  }
-
-  attachDocument(document);
+  document.addEventListener('input', convertInput, true);
 })();
 """
 
 
-def on_editor_did_init(editor):
+def on_editor_did_load_note(editor):
     script = _EDITOR_SCRIPT.replace(
         "__REPLACEMENTS__", json.dumps(REPLACEMENTS, ensure_ascii=True)
     )
@@ -247,4 +235,4 @@ def on_editor_did_init(editor):
 def install():
     from aqt import gui_hooks
 
-    gui_hooks.editor_did_init.append(on_editor_did_init)
+    gui_hooks.editor_did_load_note.append(on_editor_did_load_note)
