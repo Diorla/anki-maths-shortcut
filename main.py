@@ -171,23 +171,46 @@ _EDITOR_SCRIPT = r"""
 (() => {
   if (window.__mathShortcutsInstalled) return;
   window.__mathShortcutsInstalled = true;
+  window.__mathShortcutsMode = 'auto';
+  window.__mathShortcutsLastField = null;
 
   const replacements = __REPLACEMENTS__;
   const shortcuts = Object.keys(replacements).sort((a, b) => b.length - a.length);
   const delimiter = /[\s\u00a0,.;:!?()[\]{}$]/;
 
-  function convertInput(event) {
-    if (event.inputType && !event.inputType.startsWith('insert')) return;
+  // Same matching rules as replace_shortcuts() on the Python side.
+  const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(
+    '(?:' +
+      shortcuts
+        .map(s => (s.startsWith('\\') ? '(?<![A-Za-z0-9_\\\\])' : '') + escapeRe(s))
+        .join('|') +
+      ')(?=$|[^A-Za-z0-9_])',
+    'g'
+  );
+  const convertText = text => text.replace(pattern, m => replacements[m]);
 
+  function fieldFromEvent(event) {
     const path = event.composedPath ? event.composedPath() : [];
     let target = path[0] || event.target;
     if (target && target.nodeType !== 1) target = target.parentElement;
-    const field = target && target.closest && target.closest('[contenteditable]');
+    return target && target.closest ? target.closest('[contenteditable]') : null;
+  }
+
+  function selectionFor(field) {
+    const root = field.getRootNode();
+    return root && root.getSelection ? root.getSelection() : document.getSelection();
+  }
+
+  // Auto mode: convert as you type.
+  function convertInput(event) {
+    if (window.__mathShortcutsMode !== 'auto') return;
+    if (event.inputType && !event.inputType.startsWith('insert')) return;
+
+    const field = fieldFromEvent(event);
     if (!field) return;
 
-    const root = field.getRootNode();
-    const selection =
-      root && root.getSelection ? root.getSelection() : document.getSelection();
+    const selection = selectionFor(field);
     if (!selection || selection.rangeCount === 0) return;
 
     const node = selection.anchorNode;
@@ -210,7 +233,7 @@ _EDITOR_SCRIPT = r"""
       const start = end - shortcut.length;
       const range = document.createRange();
       range.setStart(node, start);
-      range.setEnd(node, offset); // shortcut + the delimiter just typed
+      range.setEnd(node, offset);
       selection.removeAllRanges();
       selection.addRange(range);
       document.execCommand(
@@ -220,9 +243,91 @@ _EDITOR_SCRIPT = r"""
     }
   }
 
+  // Manual mode: convert the selection, or the whole field if nothing is selected.
+  window.__mathShortcutsConvertSelection = () => {
+    const field = window.__mathShortcutsLastField;
+    if (!field || !field.isConnected) return;
+
+    const selection = selectionFor(field);
+    if (!selection) return;
+
+    let range;
+    if (
+      selection.rangeCount > 0 &&
+      !selection.isCollapsed &&
+      field.contains(selection.anchorNode)
+    ) {
+      range = selection.getRangeAt(0).cloneRange();
+    } else {
+      range = document.createRange();
+      range.selectNodeContents(field);
+    }
+
+    // Collect the selected part of every text node (keeps bold/italic etc. intact).
+    const parts = [];
+    const add = node => {
+      const start = node === range.startContainer ? range.startOffset : 0;
+      const end = node === range.endContainer ? range.endOffset : node.data.length;
+      if (end > start) parts.push({ node, start, end });
+    };
+    const ancestor = range.commonAncestorContainer;
+    if (ancestor.nodeType === Node.TEXT_NODE) {
+      add(ancestor);
+    } else {
+      const walker = document.createTreeWalker(ancestor, NodeFilter.SHOW_TEXT);
+      while (walker.nextNode()) {
+        if (range.intersectsNode(walker.currentNode)) add(walker.currentNode);
+      }
+    }
+
+    field.focus();
+    // Go backwards so earlier offsets stay valid after each replacement.
+    for (const { node, start, end } of parts.reverse()) {
+      const old = node.data.slice(start, end);
+      const converted = convertText(old);
+      if (converted === old) continue;
+      const r = document.createRange();
+      r.setStart(node, start);
+      r.setEnd(node, end);
+      selection.removeAllRanges();
+      selection.addRange(r);
+      document.execCommand('insertText', false, converted);
+    }
+  };
+
+  // Remember the last focused field, since clicking a toolbar button moves focus.
+  document.addEventListener('focusin', event => {
+    const field = fieldFromEvent(event);
+    if (field) window.__mathShortcutsLastField = field;
+  }, true);
+
   document.addEventListener('input', convertInput, true);
 })();
 """
+
+MODE_BUTTON_ID = "math_shortcuts_mode"
+
+
+def _get_config():
+    from aqt import mw
+
+    config = mw.addonManager.getConfig(__name__) or {}
+    if config.get("mode") not in ("auto", "manual"):
+        config["mode"] = "auto"
+    return config
+
+
+def _apply_mode(editor, mode):
+    """Push the mode to the page and sync the toggle button's highlight."""
+    editor.web.eval(
+        f"""
+        window.__mathShortcutsMode = {json.dumps(mode)};
+        (() => {{
+          const b = document.getElementById({json.dumps(MODE_BUTTON_ID)});
+          if (b) b.classList.toggle('highlighted', {'true' if mode == 'auto' else 'false'});
+        }})();
+        """
+    )
 
 
 def on_editor_did_load_note(editor):
@@ -230,9 +335,50 @@ def on_editor_did_load_note(editor):
         "__REPLACEMENTS__", json.dumps(REPLACEMENTS, ensure_ascii=True)
     )
     editor.web.eval(script)
+    _apply_mode(editor, _get_config()["mode"])
+
+
+def _convert_selection(editor):
+    editor.web.eval(
+        "window.__mathShortcutsConvertSelection && window.__mathShortcutsConvertSelection();"
+    )
+
+
+def _toggle_mode(editor):
+    from aqt import mw
+
+    config = _get_config()
+    config["mode"] = "manual" if config["mode"] == "auto" else "auto"
+    mw.addonManager.writeConfig(__name__, config)
+    _apply_mode(editor, config["mode"])
+
+
+def on_editor_did_init_buttons(buttons, editor):
+    buttons.append(
+        editor.addButton(
+            icon=None,
+            cmd="math_shortcuts_convert",
+            func=_convert_selection,
+            tip="Convert math shortcuts in selection (Ctrl+Shift+M)",
+            label="Σ",
+            keys="Ctrl+Shift+M",
+        )
+    )
+    buttons.append(
+        editor.addButton(
+            icon=None,
+            cmd="math_shortcuts_toggle",
+            func=_toggle_mode,
+            tip="Highlighted: convert automatically while typing. Off: manual (use Σ).",
+            label="Auto",
+            id=MODE_BUTTON_ID,
+            toggleable=True,
+        )
+    )
 
 
 def install():
     from aqt import gui_hooks
 
     gui_hooks.editor_did_load_note.append(on_editor_did_load_note)
+    gui_hooks.editor_did_init_buttons.append(on_editor_did_init_buttons)
