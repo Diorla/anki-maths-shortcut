@@ -1,0 +1,8 @@
+{
+  "package": "math-symbols-converter",
+  "name": "Math Symbols Converter",
+  "version": "0.0.1",
+  "description": "A Python package for converting LaTeX math symbols to Unicode characters.",
+  "author": "Adeola Ade",
+  "license": "MIT"
+}
